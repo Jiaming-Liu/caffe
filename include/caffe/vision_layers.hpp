@@ -76,6 +76,7 @@ class BaseConvolutionLayer : public Layer<Dtype> {
   int num_output_;
   int height_out_, width_out_;
   bool bias_term_;
+  bool mask_term_;
   bool is_1x1_;
 
  private:

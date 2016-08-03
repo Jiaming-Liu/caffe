@@ -484,6 +484,7 @@ message ConvolutionParameter {
   optional bool bias_term = 2 [default = true]; // whether to have bias terms
   // Pad, kernel size, and stride are all given as a single value for equal
   // dimensions in height and width or as Y, X pairs.
+  optional bool mask_term = 16 [default = false]; // whether to have mask terms
   optional uint32 pad = 3 [default = 0]; // The padding size (equal in Y, X)
   optional uint32 pad_h = 9 [default = 0]; // The padding height
   optional uint32 pad_w = 10 [default = 0]; // The padding width
@@ -496,12 +497,14 @@ message ConvolutionParameter {
   optional uint32 stride_w = 14; // The stride width
   optional FillerParameter weight_filler = 7; // The filler for the weight
   optional FillerParameter bias_filler = 8; // The filler for the bias
+  optional FillerParameter mask_filler = 17; // The filler for the bias
   enum Engine {
     DEFAULT = 0;
     CAFFE = 1;
     CUDNN = 2;
   }
   optional Engine engine = 15 [default = DEFAULT];
+  // next available id: 18
 }
 
 message DataParameter {
@@ -702,13 +705,16 @@ message InfogainLossParameter {
 message InnerProductParameter {
   optional uint32 num_output = 1; // The number of outputs for the layer
   optional bool bias_term = 2 [default = true]; // whether to have bias terms
+  optional bool mask_term = 6 [default = false]; // whether to have bias terms
   optional FillerParameter weight_filler = 3; // The filler for the weight
   optional FillerParameter bias_filler = 4; // The filler for the bias
-
+  optional FillerParameter mask_filler = 7; // The filler for the bias
+  
   // The first axis to be lumped into a single inner product computation;
   // all preceding axes are retained in the output.
   // May be negative to index from the end (e.g., -1 for the last axis).
   optional int32 axis = 5 [default = 1];
+  // next available id: 8
 }
 
 // Message that stores parameters used by LogLayer

@@ -6,6 +6,7 @@
 #include "caffe/layer.hpp"
 #include "caffe/util/math_functions.hpp"
 #include "caffe/vision_layers.hpp"
+#include "caffe/masked_blob.hpp"
 
 namespace caffe {
 
@@ -14,6 +15,7 @@ void InnerProductLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
       const vector<Blob<Dtype>*>& top) {
   const int num_output = this->layer_param_.inner_product_param().num_output();
   bias_term_ = this->layer_param_.inner_product_param().bias_term();
+  mask_term_ = this->layer_param_.inner_product_param().mask_term();
   N_ = num_output;
   const int axis = bottom[0]->CanonicalAxisIndex(
       this->layer_param_.inner_product_param().axis());
@@ -25,7 +27,9 @@ void InnerProductLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
   if (this->blobs_.size() > 0) {
     LOG(INFO) << "Skipping parameter initialization";
   } else {
-    if (bias_term_) {
+    if (bias_term_ && mask_term_) {
+      this->blobs_.resize(3);
+    } else if (bias_term_ || mask_term_){
       this->blobs_.resize(2);
     } else {
       this->blobs_.resize(1);
@@ -34,7 +38,11 @@ void InnerProductLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
     vector<int> weight_shape(2);
     weight_shape[0] = N_;
     weight_shape[1] = K_;
-    this->blobs_[0].reset(new Blob<Dtype>(weight_shape));
+    if (mask_term_){
+      this->blobs_[0].reset(new MaskedBlob<Dtype>(weight_shape));
+    } else {
+      this->blobs_[0].reset(new Blob<Dtype>(weight_shape));
+    }
     // fill the weights
     shared_ptr<Filler<Dtype> > weight_filler(GetFiller<Dtype>(
         this->layer_param_.inner_product_param().weight_filler()));
@@ -47,8 +55,21 @@ void InnerProductLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
           this->layer_param_.inner_product_param().bias_filler()));
       bias_filler->Fill(this->blobs_[1].get());
     }
-  }  // parameter initialization
-  this->param_propagate_down_.resize(this->blobs_.size(), true);
+    // If necessary, intiialize and fill the mask term
+	if (mask_term_) {
+      this->blobs_[bias_term_?2:1].reset(new Blob<Dtype>(weight_shape));
+      shared_ptr<Filler<Dtype> > mask_filler(GetFiller<Dtype>(
+          this->layer_param_.inner_product_param().mask_filler()));
+      mask_filler->Fill(this->blobs_[bias_term_?2:1].get());
+      boost::static_pointer_cast<MaskedBlob<Dtype> >(this->blobs_[0])->setMask(this->blobs_[bias_term_?2:1]);
+    }
+  }  
+  // parameter initialization
+  if (bias_term_) { 
+    this->param_propagate_down_.resize(2, true);
+  } else {
+    this->param_propagate_down_.resize(1, true);
+  }
 }
 
 template <typename Dtype>

@@ -5,6 +5,7 @@
 #include "caffe/util/im2col.hpp"
 #include "caffe/util/math_functions.hpp"
 #include "caffe/vision_layers.hpp"
+#include "caffe/masked_blob.hpp"
 
 namespace caffe {
 
@@ -72,32 +73,67 @@ void BaseConvolutionLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
   // - blobs_[0] holds the filter weights
   // - blobs_[1] holds the biases (optional)
   bias_term_ = this->layer_param_.convolution_param().bias_term();
+  mask_term_ = this->layer_param_.convolution_param().mask_term();
   if (this->blobs_.size() > 0) {
     LOG(INFO) << "Skipping parameter initialization";
   } else {
-    if (bias_term_) {
+    if (bias_term_ && mask_term_) {
+      this->blobs_.resize(3);
+    } else if (bias_term_ || mask_term_){
       this->blobs_.resize(2);
     } else {
       this->blobs_.resize(1);
     }
     // Initialize and fill the weights:
     // output channels x input channels per-group x kernel height x kernel width
-    this->blobs_[0].reset(new Blob<Dtype>(
-        conv_out_channels_, conv_in_channels_ / group_, kernel_h_, kernel_w_));
+    if (mask_term_){
+      this->blobs_[0].reset(new MaskedBlob<Dtype>(
+          conv_out_channels_, conv_in_channels_ / group_, kernel_h_, kernel_w_));
+    } else {
+      this->blobs_[0].reset(new Blob<Dtype>(
+          conv_out_channels_, conv_in_channels_ / group_, kernel_h_, kernel_w_));
+    }
     shared_ptr<Filler<Dtype> > weight_filler(GetFiller<Dtype>(
         this->layer_param_.convolution_param().weight_filler()));
     weight_filler->Fill(this->blobs_[0].get());
     // If necessary, initialize and fill the biases.
-    if (bias_term_) {
+    if ( bias_term_ && mask_term_) {
       vector<int> bias_shape(1, num_output_);
       this->blobs_[1].reset(new Blob<Dtype>(bias_shape));
       shared_ptr<Filler<Dtype> > bias_filler(GetFiller<Dtype>(
           this->layer_param_.convolution_param().bias_filler()));
       bias_filler->Fill(this->blobs_[1].get());
-    }
+	  
+  	  this->blobs_[2].reset(new Blob<Dtype>(
+          conv_out_channels_, conv_in_channels_ / group_, kernel_h_, kernel_w_));
+        shared_ptr<Filler<Dtype> > mask_filler(GetFiller<Dtype>(
+            this->layer_param_.convolution_param().mask_filler()));
+        mask_filler->Fill(this->blobs_[2].get());
+	    boost::static_pointer_cast<MaskedBlob<Dtype> >(this->blobs_[0])->setMask(this->blobs_[2]);
+    } else {
+		if (bias_term_) {
+		  vector<int> bias_shape(1, num_output_);
+		    this->blobs_[1].reset(new Blob<Dtype>(bias_shape));
+		  shared_ptr<Filler<Dtype> > bias_filler(GetFiller<Dtype>(
+            this->layer_param_.convolution_param().bias_filler()));
+		  bias_filler->Fill(this->blobs_[1].get());
+		}
+		if (mask_term_) {
+		  this->blobs_[1].reset(new Blob<Dtype>(
+			conv_out_channels_, conv_in_channels_ / group_, kernel_h_, kernel_w_));
+		  shared_ptr<Filler<Dtype> > mask_filler(GetFiller<Dtype>(
+			  this->layer_param_.convolution_param().mask_filler()));
+		  mask_filler->Fill(this->blobs_[1].get());
+	    boost::static_pointer_cast<MaskedBlob<Dtype> >(this->blobs_[0])->setMask(this->blobs_[1]);
+		}
+	}
   }
   // Propagate gradients to the parameters (as directed by backward pass).
-  this->param_propagate_down_.resize(this->blobs_.size(), true);
+  if(bias_term_){
+	  this->param_propagate_down_.resize(2, true);
+  } else {
+    this->param_propagate_down_.resize(1, true);
+  }
 }
 
 template <typename Dtype>

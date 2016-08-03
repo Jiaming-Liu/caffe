@@ -1,4 +1,8 @@
-# Action Recognition with Deep Learning
+# Action Recognition with Deep Learning on masked network
+
+This branch applies mask on the weights, enabling network pruning, DSD, etc. This feature is realized by multiplying the mask with the diff of param blob when updating (see include/caffe/masked_blob.hpp). A demo can be found in models/bvlc_alexnet/train_val_masked.prototxt. One should use matcaffe or pycaffe to set the mask.
+
+=========
 
 [![Build Status](https://travis-ci.org/yjxiong/caffe.svg?branch=action_recog)](https://travis-ci.org/yjxiong/caffe)
 
