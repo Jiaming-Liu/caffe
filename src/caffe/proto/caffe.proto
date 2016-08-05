@@ -89,6 +89,14 @@ message NetParameter {
   // connectivity and behavior, is specified as a LayerParameter.
   repeated LayerParameter layer = 100;  // ID 100 so layers are printed last.
 
+  // Whether to perform memory optimization
+  enum OptimizeMem {
+    NO_OPTIM = 0;
+    TRAIN_ONLY = 1;
+    ALL_OPTIM = 2;
+  }
+  optional OptimizeMem optimize_mem = 11 [default=TRAIN_ONLY];
+
   // DEPRECATED: use 'layer' instead.
   repeated V1LayerParameter layers = 2;
 }
@@ -314,6 +322,7 @@ message LayerParameter {
   // Parameters shared by loss layers.
   optional LossParameter loss_param = 101;
 
+  optional bool no_mem_opt = 900 [default = false];
   // Layer type-specific parameters.
   //
   // Note: certain layers may have more than one computational engine
@@ -402,6 +411,10 @@ message TransformationParameter {
 
   //if set to true, it is optical flow field
   optional bool is_flow = 14 [default = false];
+
+  //if set to true, will use original image processing mode
+  // i.e. will use Inception style data augmentation
+  optional bool original_image = 20 [ default = false];
 }
 
 // Message that stores parameters shared by loss layers
@@ -809,6 +822,7 @@ message ReductionParameter {
     ASUM = 2;
     SUMSQ = 3;
     MEAN = 4;
+    TOPK = 5;  // top-k reduction output the average of the largest k elements
   }
 
   optional ReductionOp operation = 1 [default = SUM]; // reduction operation
@@ -829,6 +843,8 @@ message ReductionParameter {
   optional int32 axis = 2 [default = 0];
 
   optional float coeff = 3 [default = 1.0]; // coefficient for output
+
+  optional int32 k = 4 [default = 1]; // k for top k reduction (only used in batch reduction layer)
 }
 
 // Message that stores parameters used by ReLULayer

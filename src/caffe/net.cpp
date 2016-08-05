@@ -293,6 +293,15 @@ void Net<Dtype>::Init(const NetParameter& in_param) {
   debug_info_ = param.debug_info();
   LOG(INFO) << "Network initialization done.";
   LOG(INFO) << "Memory required for data: " << memory_used_ * sizeof(Dtype);
+
+  // optimize memory
+  const NetParameter_OptimizeMem om = param.optimize_mem();
+  const bool need_optimze_mem =
+    (om == NetParameter_OptimizeMem_TRAIN_ONLY && phase_ == TRAIN)
+    || (om == NetParameter_OptimizeMem_ALL_OPTIM);
+  if (!debug_info_ && need_optimze_mem) {
+    MemoryOptimize();
+  }
 }
 
 template <typename Dtype>
@@ -624,8 +633,22 @@ void Net<Dtype>::BackwardFromTo(int start, int end) {
 
   for (int i = start; i >= end; --i) {
     if (layer_need_backward_[i]) {
+
+      //DEBUG USE
+//      for (int x = 0; x < top_vecs_[i].size(); ++x){
+//        LOG(INFO)<<"Layer "<<i<<" name "<<layer_names_[i]
+//          <<" top blob "<<x<<" ptr: "<<top_vecs_[i][x]->gpu_diff();
+//      }
+//
+//      for (int x = 0; x < bottom_vecs_[i].size(); ++x){
+//        LOG(INFO)<<"Layer "<<i<<" name "<<layer_names_[i]
+//          <<" bottom blob "<<x<<" ptr: "<<bottom_vecs_[i][x]->mutable_gpu_diff();
+//      }
+      //END DEBUG
+
       layers_[i]->Backward(
           top_vecs_[i], bottom_need_backward_[i], bottom_vecs_[i]);
+
       if (debug_info_) { BackwardDebugInfo(i); }
 
 #ifdef USE_MPI
@@ -942,6 +965,255 @@ const shared_ptr<Layer<Dtype> > Net<Dtype>::layer_by_name(
   return layer_ptr;
 }
 
+/**
+ * This class is the core of memory optimization
+ * It simulates a abstract ``slot'' with preemption.
+ * During the dry-run process, a dynamic number of slots are created when deemed necessary (no empty slot is available
+ * when we are acquring one).
+ * By keeping track of which blob used which slot, we can safely make a series of blobs share the underlying storage
+ * without the risk of data corruption.
+ */
+class SlotMeta {
+public:
+    SlotMeta()
+      : key_(), ref_(0) { }
+
+    SlotMeta(const string& key, int ref)
+      : key_(key), ref_(ref) { }
+
+    inline const string& key() const { return key_; }
+    inline int ref() const { return ref_; }
+
+    inline void DerefOne(){
+      CHECK_GT(ref_, 0);
+      ref_ -= 1;
+      if (ref_ == 0){
+        key_.clear();
+      }
+    }
+
+    inline void IncRef(){ref_ += 1;}
+
+    void RefSlot(const string& key, int ref) {
+      CHECK(key_.empty());
+      CHECK_NE(key_, key);
+      CHECK_GT(ref, 0);
+      key_ = key;
+      ref_ = ref;
+    }
+
+    inline bool Empty(){
+      return key_.empty();
+    }
+
+    inline bool isSlot(const string& key){return key_ == key;}
+
+private:
+    string key_;
+    int ref_;
+};
+
+size_t AcquireSlot(vector<SlotMeta>& slot_vec, const string& key, int ref) {
+  for (size_t i = 0 ; i < slot_vec.size(); ++i) {
+    if (slot_vec[i].Empty()) {
+      slot_vec[i].RefSlot(key, ref);
+      return i;
+    }
+  }
+
+  // no available slot, need a new one
+  slot_vec.push_back(SlotMeta(key, ref));
+
+  return slot_vec.size() - 1;
+}
+
+int FindSlot(vector<SlotMeta>& slot_vec, const string& key){
+  for (int i = 0; i < slot_vec.size(); ++i){
+    if (slot_vec[i].isSlot(key)){
+      return i;
+    }
+  }
+  return -1;
+}
+
+template <typename Dtype>
+void Net<Dtype>::MemoryOptimize() {
+  // Dry run phase
+  // In this phase, we assume the network topology has been setup
+  boost::unordered_map<string, int> slot_index;
+
+  vector<SlotMeta> slots;
+
+  // Forward pass, try to reuse blobs' data memory
+  for (int i = 0; i < layers_.size(); ++i) {
+    if (layers_[i]->layer_param().no_mem_opt()) continue;
+    const vector<Blob<Dtype>* >& layer_top = top_vecs_[i];
+    const vector<Blob<Dtype>* >& layer_bottom = bottom_vecs_[i];
+    LOG(INFO) << "layer " << i << " " << layer_names_[i];
+    // Find slot for each top blob's data
+    for (int i_top = 0; i_top < layer_top.size(); ++i_top) {
+      const string& top_name = blob_names_[top_id_vecs_[i][i_top]];
+      int idx = FindSlot(slots, top_name + "_data");
+      if (idx == -1) {
+        // Detect share data conditions
+        bool sharing_data = false;
+        for (int i_bottom = 0; i_bottom < layer_bottom.size(); ++i_bottom) {
+          if (layers_[i]->is_sharing_data(i_top, i_bottom)) {
+            sharing_data = true;
+            const string& bottom_name = blob_names_[bottom_id_vecs_[i][i_bottom]];
+            idx = FindSlot(slots, bottom_name + "_data");
+            LOG(INFO) << "top " << top_name
+                      << " shares data with bottom " << bottom_name
+                      << " slot " << idx;
+            break;
+          }
+        }
+        if (!sharing_data) {
+          if (!layers_[i]->loss(i_top)) {
+            idx = (int)AcquireSlot(slots, top_name + "_data", 1);
+            slot_index[top_name + "_data"] = idx;
+            LOG(INFO) << "top " << top_name << " acquires data slot " << idx;
+          }
+        } else {
+          slots[idx].IncRef();
+          slot_index[top_name + "_data"] = idx;
+        }
+      } else {
+        // Top data blob is already assigned a slot (maybe inplace layer).
+        slots[idx].IncRef();
+        LOG(INFO) << "top " << top_name << " refers to data slot " << idx;
+      }
+    }
+    // Deref bottom blob's data slot if this layer does not propagate down.
+    if (phase_ == TRAIN && layer_need_backward_[i]) continue;
+    for (int i_bottom = 0; i_bottom < layer_bottom.size(); ++i_bottom) {
+      const string& bottom_name = blob_names_[bottom_id_vecs_[i][i_bottom]];
+      int idx = FindSlot(slots, bottom_name + "_data");
+      if (slot_index.find(bottom_name + "_data") != slot_index.end()) {
+        idx = slot_index[bottom_name + "_data"];
+      }
+      if (idx >= 0) {
+        // idx == -1 if this is an input blob
+        // as a good practice, we do not touch the input blobs' data memory cause leads to unwanted behaviors.
+        slots[idx].DerefOne();
+      }
+      LOG(INFO) << "bottom " << bottom_name << " derefs data slot " << idx;
+    }
+  }
+
+  // backward pass, try to reuse blobs' diff memory
+  for (int i = (layers_.size() -1); i >=0; --i){
+    vector<Blob<Dtype>* >& layer_top = top_vecs_[i];
+    vector<int> layer_top_idx = top_id_vecs_[i];
+    vector<Blob<Dtype>* >& layer_bottom = bottom_vecs_[i];
+    vector<int> layer_bottom_idx = bottom_id_vecs_[i];
+
+    LOG(INFO)<<"layer id: "<<i<<" name: "<<layer_names_[i];
+
+    // first deal with bottoms
+    for (int i_bottom = 0; i_bottom < layer_bottom.size(); ++i_bottom){
+      const string& bottom_name = blob_names_[layer_bottom_idx[i_bottom]];
+      int idx = FindSlot(slots, bottom_name + "_diff");
+      if (!(layers_[i]->layer_param().no_mem_opt())){
+      if (idx == -1){
+        //detect share diff conditions
+        bool sharing_diff = false;
+        for (int i_top = 0; i_top < layer_top.size(); ++i_top){
+          if(layers_[i]->is_sharing_diff(i_top, i_bottom)){
+            const string& top_name = blob_names_[layer_top_idx[i_top]];
+            sharing_diff = true;
+            idx = FindSlot(slots, top_name + "_diff");
+          }
+        }
+        if (!sharing_diff) {
+          idx = (int) AcquireSlot(slots, bottom_name + "_diff", 1);
+          slot_index[bottom_name + "_diff"] = idx;
+          LOG(INFO) << "acquired slot for new blob";
+        }else{
+          LOG(INFO) << "sharing diff using slot "<<idx;
+          if(idx != -1) {
+            // idx == -1 means this is an output blob
+            // as a good practice, we do not touch the output blobs' diff memroy cause leads to unwanted behaviors.
+            slots[idx].IncRef();
+            slot_index[bottom_name + "_diff"] = idx;
+          }
+        }
+      }else{
+        // bottom is already registered
+        // usually this means in-place operation
+        slots[idx].IncRef();
+      }
+      }
+      LOG(INFO)<<"bottom blob "<<i_bottom<<" name "
+               <<bottom_name<<" slot id "<<idx;
+    }
+
+    // then deal with top
+    for (int i_top = 0; i_top < layer_top.size(); ++i_top){
+      const string& top_name = blob_names_[layer_top_idx[i_top]];
+
+      // find the top in the slots
+      int idx = FindSlot(slots, top_name + "_diff");
+
+      // look for shared diff
+      if (slot_index.find(top_name + "_diff") != slot_index.end()){
+        idx = slot_index[top_name + "_diff"];
+      }
+      //after the layer's operation, the refcount of top should be decreased by 1
+      if (idx != -1)
+        slots[idx].DerefOne();
+
+      LOG(INFO) << "top blob " << i_top
+                << " name " << top_name << " slot id " << idx;
+    }
+  }
+
+  // Memory assignment phase
+  shared_storage_.resize(slots.size());
+  for (int i_mem = 0; i_mem < shared_storage_.size(); i_mem++){
+    shared_storage_[i_mem].reset(new SyncedMemory(1));
+  }
+
+  size_t count_raw = 0;
+  size_t count_opt = 0;
+  for (int i_blob = 0; i_blob < blobs_.size(); ++i_blob){
+    const string& name = blob_names_[i_blob];
+    const size_t bytes = blobs_[i_blob]->count() * sizeof(Dtype);
+    count_raw += bytes * 2;
+    int idx = -1;
+
+    // all blobs in the same slot share a same externally hosted SyncedMem instance
+    // we will keep track of the estimated memory usage reduction while linking them to the SyncedMem
+    if (slot_index.find(name + "_data") != slot_index.end()) {
+      idx = slot_index[name + "_data"];
+      blobs_[i_blob]->SetDataStorage(shared_storage_[idx]);
+      shared_storage_[idx]->Resize(bytes);
+    } else {
+      count_opt += bytes;
+    }
+    LOG(INFO) << "blob " << i_blob
+              << " name " << blob_names_[i_blob]
+              << " data idx " << idx;
+    if (slot_index.find(name + "_diff") != slot_index.end()) {
+      idx = slot_index[name + "_diff"];
+      blobs_[i_blob]->SetDiffStorage(shared_storage_[idx]);
+      shared_storage_[idx]->Resize(bytes);
+    } else {
+      count_opt += bytes;
+    }
+    LOG(INFO) << "blob " << i_blob
+              << " name " << blob_names_[i_blob]
+              << " diff idx " << idx;
+  }
+
+  for (int i_mem = 0; i_mem < shared_storage_.size(); i_mem++){
+    LOG(INFO) << "storage memory slot " << i_mem
+              << " size " << shared_storage_[i_mem]->size();
+    count_opt += shared_storage_[i_mem]->size();
+  }
+
+  LOG(INFO) << "raw memory " << count_raw << " opt memory " << count_opt;
+}
 INSTANTIATE_CLASS(Net);
 
 }  // namespace caffe
